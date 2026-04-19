@@ -663,19 +663,48 @@ function setMode(m) {
   const lb = document.getElementById('liveBtn');
   db.className = 'acc-btn' + (m==='demo' ? ' demo-on' : '');
   lb.className = 'acc-btn' + (m==='live' ? ' live-on' : '');
-  if(m==='demo') {
-    S.balance = 10000; S.pnl = 0;
-    document.getElementById('balAmt').textContent = '$10,000.00';
-    document.getElementById('balCurr').textContent = 'DEMO ACCOUNT · USD';
-  } else {
-    document.getElementById('balCurr').textContent = 'LIVE ACCOUNT · ' + (S.apiToken ? 'CONNECTED' : 'NO API');
-    toast('⚠️ Switched to LIVE — real money mode!');
+
+  if(!S.apiConnected || !S.derivAccounts || S.derivAccounts.length === 0) {
+    // Not connected yet — show placeholder
+    if(m==='demo') {
+      document.getElementById('balAmt').textContent = '$0.00';
+      document.getElementById('balCurr').textContent = 'DEMO ACCOUNT · Connect API to see balance';
+    } else {
+      document.getElementById('balAmt').textContent = '$0.00';
+      document.getElementById('balCurr').textContent = 'LIVE ACCOUNT · Connect API to see balance';
+      toast('⚠️ Switched to LIVE — real money mode!');
+    }
+    updateDash();
+    return;
   }
+
+  // Find the right account to switch to
+  const targetType = m === 'demo' ? 'virtual' : 'real';
+  const targetAcc = S.derivAccounts.find(a => a.account_type === targetType);
+
+  if(!targetAcc) {
+    toast(`⚠️ No ${m.toUpperCase()} account found on this token`);
+    updateDash();
+    return;
+  }
+
+  // Switch account on Deriv WS
+  if(S.derivWS && S.derivWS.readyState === 1) {
+    document.getElementById('balCurr').textContent = `⏳ Switching to ${m.toUpperCase()}...`;
+    S.derivWS.send(JSON.stringify({ switch_account: targetAcc.loginid }));
+    // Re-authorize with same token on new account
+    setTimeout(() => {
+      if(S.derivWS) S.derivWS.send(JSON.stringify({ balance: 1, subscribe: 1 }));
+    }, 500);
+    if(m==='live') toast('⚠️ Switched to LIVE — real money!');
+    else toast('✅ Switched to DEMO account');
+  }
+
   updateDash();
 }
 
 // ================================================================
-// API CONNECT
+// API CONNECT — Real Deriv WebSocket
 // ================================================================
 function connectAPI() { connectAPICore('apiToken','connStatus'); }
 function connectAPI2() { connectAPICore('apiToken2','connStatus2'); }
@@ -686,18 +715,75 @@ function connectAPICore(inputId, statusId) {
   if(!token) { toast('⚠️ Please paste your API token first!'); return; }
   statusEl.style.color = 'var(--gold)';
   statusEl.textContent = '⏳ Connecting to Deriv...';
-  setTimeout(() => {
-    S.apiToken = token;
-    S.apiConnected = true;
-    document.getElementById('connDot').classList.add('on');
-    statusEl.style.color = 'var(--green)';
-    statusEl.textContent = '✅ Connected to Deriv API successfully!';
-    if(document.getElementById('connStatus')) {
-      document.getElementById('connStatus').style.color = 'var(--green)';
-      document.getElementById('connStatus').textContent = '✅ Connected to Deriv API!';
-    }
-    toast('✅ Deriv API Connected!');
-  }, 1800);
+
+  // Store token in both inputs
+  document.getElementById('apiToken').value = token;
+  document.getElementById('apiToken2').value = token;
+  S.apiToken = token;
+
+  // Connect via Deriv WebSocket
+  try {
+    const ws = new WebSocket('wss://ws.binaryws.com/websockets/v3?app_id=1089');
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ authorize: token }));
+    };
+    ws.onmessage = (msg) => {
+      const data = JSON.parse(msg.data);
+      if(data.error) {
+        statusEl.style.color = 'var(--red)';
+        statusEl.textContent = '❌ ' + (data.error.message || 'Invalid API token');
+        toast('❌ Deriv connection failed: ' + data.error.message);
+        ws.close();
+        return;
+      }
+      if(data.msg_type === 'authorize') {
+        const acc = data.authorize;
+        S.apiConnected = true;
+        S.derivWS = ws;
+        S.derivAccounts = acc.account_list || [];
+        S.derivLoginId = acc.loginid;
+        S.derivCurrency = acc.currency;
+        S.derivEmail = acc.email;
+
+        document.getElementById('connDot').classList.add('on');
+
+        // Fetch balance
+        ws.send(JSON.stringify({ balance: 1, subscribe: 1 }));
+
+        statusEl.style.color = 'var(--green)';
+        statusEl.textContent = `✅ Connected — ${acc.email} (${acc.loginid})`;
+        document.getElementById('connStatus').style.color = 'var(--green)';
+        document.getElementById('connStatus').textContent = `✅ Connected — ${acc.loginid} · ${acc.currency}`;
+        toast(`✅ Deriv Connected! Welcome ${acc.email}`);
+      }
+      if(data.msg_type === 'balance') {
+        const bal = data.balance;
+        S.balance = parseFloat(bal.balance);
+        S.derivCurrency = bal.currency;
+        // Detect account type from loginid
+        const isDemo = S.derivLoginId && S.derivLoginId.startsWith('VRTC');
+        const modeLabel = isDemo ? 'DEMO' : 'LIVE';
+        document.getElementById('balAmt').textContent = bal.currency + ' ' + parseFloat(bal.balance).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+        document.getElementById('balCurr').textContent = `${modeLabel} ACCOUNT · ${bal.currency} · ${S.derivLoginId}`;
+        // Auto set toggle
+        if(isDemo) setMode('demo'); else setMode('live');
+      }
+    };
+    ws.onerror = () => {
+      statusEl.style.color = 'var(--red)';
+      statusEl.textContent = '❌ Connection error — check your token';
+      toast('❌ Could not connect to Deriv');
+    };
+    ws.onclose = () => {
+      if(S.apiConnected) {
+        document.getElementById('connDot').classList.remove('on');
+        S.apiConnected = false;
+      }
+    };
+  } catch(e) {
+    statusEl.style.color = 'var(--red)';
+    statusEl.textContent = '❌ Connection failed';
+  }
 }
 
 // ================================================================
